@@ -10,8 +10,6 @@ import sqlite3
 import os
 import json
 from pathlib import Path
-import bcrypt
-from typing import Optional, Tuple
 
 plotly_events_import_error = None
 try:
@@ -19,6 +17,50 @@ try:
 except ImportError as exc:
     plotly_events = None
     plotly_events_import_error = exc
+
+
+# ============================================================================
+# AUTENTICACIÓN SIMPLE
+# ============================================================================
+
+def show_simple_login():
+    """Muestra pantalla de login simple con usuario y contraseña.
+    Credenciales guardadas en st.secrets para no exponer en código."""
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        st.markdown("## 🔐 Acceso a Planificación Ventanas")
+        st.divider()
+        
+        username = st.text_input(
+            "Usuario",
+            placeholder="Ingrese su usuario",
+            key="login_username"
+        )
+        password = st.text_input(
+            "Contraseña",
+            type="password",
+            placeholder="Ingrese su contraseña",
+            key="login_password"
+        )
+        
+        if st.button("🔓 Ingresar", use_container_width=True, type="primary"):
+            # Obtener credenciales desde secrets (no están en el código)
+            valid_user = st.secrets.get("SIMPLE_LOGIN_USER", "")
+            valid_password = st.secrets.get("SIMPLE_LOGIN_PASSWORD", "")
+            
+            if not valid_user or not valid_password:
+                st.error("❌ Configuración de credenciales no encontrada")
+            elif username == valid_user and password == valid_password:
+                st.session_state.authenticated = True
+                st.success(f"✅ Bienvenido {username}!")
+                time.sleep(1)
+                st.rerun()
+            else:
+                st.error("❌ Usuario o contraseña incorrectos")
+        
+        st.divider()
+        st.info("ℹ️ Utiliza las credenciales de tu organización")
 
 
 # ============================================================================
@@ -85,333 +127,6 @@ def init_database():
     
     conn.commit()
     conn.close()
-
-
-# ============================================================================
-# AUTENTICACIÓN DE USUARIOS
-# ============================================================================
-
-def init_users_table():
-    """Crea la tabla de usuarios si no existe e inicializa admin si es necesario."""
-    db_path = get_db_path()
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    
-    # Crear tabla de usuarios
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            role TEXT DEFAULT 'user',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    # Verificar si existe el usuario admin
-    cursor.execute("SELECT COUNT(*) FROM users WHERE username = 'admin'")
-    admin_exists = cursor.fetchone()[0] > 0
-    
-    # Crear usuario admin por defecto si no existe
-    if not admin_exists:
-        admin_hash = hash_password("admin123")
-        cursor.execute(
-            "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
-            ("admin", admin_hash, "admin")
-        )
-    
-    conn.commit()
-    conn.close()
-
-
-def hash_password(password: str) -> str:
-    """
-    Genera un hash seguro de la contraseña usando bcrypt.
-    
-    Args:
-        password: Contraseña en texto plano
-        
-    Returns:
-        Hash seguro de la contraseña
-    """
-    salt = bcrypt.gensalt(rounds=12)
-    hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
-    return hashed.decode('utf-8')
-
-
-def verify_password(password: str, password_hash: str) -> bool:
-    """
-    Verifica que una contraseña coincida con su hash.
-    
-    Args:
-        password: Contraseña en texto plano
-        password_hash: Hash almacenado en la BD
-        
-    Returns:
-        True si la contraseña es correcta, False en caso contrario
-    """
-    try:
-        return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
-    except Exception:
-        return False
-
-
-def authenticate_user(username: str, password: str) -> Tuple[bool, Optional[str], Optional[str]]:
-    """
-    Autentica un usuario verificando sus credenciales en la BD.
-    
-    Args:
-        username: Nombre de usuario
-        password: Contraseña en texto plano
-        
-    Returns:
-        (success, username, role): Tupla con éxito, nombre de usuario y rol
-        Si falla, retorna (False, None, None)
-    """
-    db_path = get_db_path()
-    
-    if not os.path.exists(db_path):
-        return False, None, None
-    
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        # Buscar usuario por nombre
-        cursor.execute(
-            "SELECT username, password_hash, role FROM users WHERE username = ?",
-            (username,)
-        )
-        user = cursor.fetchone()
-        conn.close()
-        
-        if not user:
-            return False, None, None
-        
-        username_db, password_hash, role = user
-        
-        # Verificar contraseña
-        if verify_password(password, password_hash):
-            return True, username_db, role
-        else:
-            return False, None, None
-            
-    except Exception as e:
-        st.error(f"Error en autenticación: {str(e)}")
-        return False, None, None
-
-
-def register_user(username: str, password: str, role: str = "user") -> Tuple[bool, str]:
-    """
-    Registra un nuevo usuario en la base de datos.
-    
-    Args:
-        username: Nombre de usuario (debe ser único)
-        password: Contraseña en texto plano
-        role: Rol del usuario (default 'user')
-        
-    Returns:
-        (success, message): Tupla con éxito y mensaje descriptivo
-    """
-    db_path = get_db_path()
-    
-    if not username or not password:
-        return False, "Usuario y contraseña son obligatorios"
-    
-    if len(password) < 6:
-        return False, "La contraseña debe tener al menos 6 caracteres"
-    
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        password_hash = hash_password(password)
-        cursor.execute(
-            "INSERT INTO users (username, password_hash, role) VALUES (?, ?, ?)",
-            (username, password_hash, role)
-        )
-        
-        conn.commit()
-        conn.close()
-        
-        return True, "Usuario registrado exitosamente"
-        
-    except sqlite3.IntegrityError:
-        return False, "El usuario ya existe"
-    except Exception as e:
-        return False, f"Error al registrar: {str(e)}"
-
-
-def change_password(username: str, old_password: str, new_password: str) -> Tuple[bool, str]:
-    """
-    Cambia la contraseña de un usuario existente.
-    
-    Args:
-        username: Nombre de usuario
-        old_password: Contraseña actual
-        new_password: Nueva contraseña
-        
-    Returns:
-        (success, message): Tupla con éxito y mensaje descriptivo
-    """
-    # Verificar contraseña actual
-    success, _, _ = authenticate_user(username, old_password)
-    if not success:
-        return False, "Contraseña actual incorrecta"
-    
-    if len(new_password) < 6:
-        return False, "La nueva contraseña debe tener al menos 6 caracteres"
-    
-    try:
-        db_path = get_db_path()
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        new_hash = hash_password(new_password)
-        cursor.execute(
-            "UPDATE users SET password_hash = ? WHERE username = ?",
-            (new_hash, username)
-        )
-        
-        conn.commit()
-        conn.close()
-        
-        return True, "Contraseña cambiada exitosamente"
-        
-    except Exception as e:
-        return False, f"Error al cambiar contraseña: {str(e)}"
-
-
-def show_login():
-    """
-    Muestra la pantalla de login centrada y maneja la autenticación.
-    """
-    col1, col2, col3 = st.columns([1, 2, 1])
-    
-    with col2:
-        st.markdown("## 🔐 Acceso a Planificación Ventanas")
-        st.divider()
-        
-        username = st.text_input(
-            "Usuario",
-            placeholder="Ingrese su usuario",
-            key="login_username"
-        )
-        password = st.text_input(
-            "Contraseña",
-            type="password",
-            placeholder="Ingrese su contraseña",
-            key="login_password"
-        )
-        
-        col_login, col_demo = st.columns(2)
-        
-        with col_login:
-            if st.button("🔓 Ingresar", use_container_width=True, type="primary"):
-                if not username or not password:
-                    st.error("⚠️ Usuario y contraseña son obligatorios")
-                else:
-                    success, auth_username, role = authenticate_user(username, password)
-                    
-                    if success:
-                        st.session_state.authenticated = True
-                        st.session_state.username = auth_username
-                        st.session_state.role = role
-                        st.success(f"✅ Bienvenido {auth_username}!")
-                        time.sleep(1)
-                        st.rerun()
-                    else:
-                        st.error("❌ Usuario o contraseña incorrectos")
-        
-        with col_demo:
-            st.caption("Demo: admin / admin123")
-        
-        st.divider()
-        st.markdown("""
-        **Credenciales iniciales:**
-        - Usuario: `admin`
-        - Contraseña: `admin123`
-        
-        ⚠️ Se recomienda cambiar la contraseña en el menú de la aplicación
-        """)
-
-
-def show_logout_section():
-    """
-    Muestra la sección de usuario y botón de logout en el sidebar.
-    """
-    with st.sidebar:
-        st.divider()
-        st.markdown("---")
-        
-        col1, col2 = st.columns([3, 1])
-        
-        with col1:
-            st.caption(f"👤 **{st.session_state.username}**")
-            role_badge = "🔑 Admin" if st.session_state.role == "admin" else "👥 Usuario"
-            st.caption(role_badge)
-        
-        with col2:
-            if st.button("🚪", help="Cerrar sesión", use_container_width=True):
-                # Limpiar solo las claves de autenticación
-                st.session_state.pop("authenticated", None)
-                st.session_state.pop("username", None)
-                st.session_state.pop("role", None)
-                # NO borrar records, crane_table, week_offset, etc.
-                st.info("Sesión cerrada")
-                time.sleep(1)
-                st.rerun()
-
-
-def show_change_password_modal():
-    """
-    Muestra un modal para cambiar la contraseña del usuario actual.
-    """
-    if st.session_state.get("show_change_password", False):
-        with st.sidebar:
-            st.divider()
-            st.subheader("🔑 Cambiar Contraseña")
-            
-            old_password = st.text_input(
-                "Contraseña actual",
-                type="password",
-                key="old_password"
-            )
-            new_password = st.text_input(
-                "Nueva contraseña",
-                type="password",
-                key="new_password"
-            )
-            confirm_password = st.text_input(
-                "Confirmar nueva contraseña",
-                type="password",
-                key="confirm_password"
-            )
-            
-            col1, col2 = st.sidebar.columns(2)
-            
-            with col1:
-                if st.button("Guardar"):
-                    if new_password != confirm_password:
-                        st.error("Las contraseñas no coinciden")
-                    else:
-                        success, message = change_password(
-                            st.session_state.username,
-                            old_password,
-                            new_password
-                        )
-                        if success:
-                            st.success(message)
-                            st.session_state.show_change_password = False
-                            time.sleep(1)
-                            st.rerun()
-                        else:
-                            st.error(message)
-            
-            with col2:
-                if st.button("Cancelar"):
-                    st.session_state.show_change_password = False
-                    st.rerun()
 
 
 def get_current_week_start():
@@ -632,21 +347,43 @@ LINE_SERVICES = {
 }
 
 
+def show_logout_section():
+    """Muestra sección de usuario y botón de logout en el sidebar."""
+    with st.sidebar:
+        st.divider()
+        st.markdown("---")
+        
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            st.caption(f"👤 **Usuario autenticado**")
+        
+        with col2:
+            if st.button("🚪", help="Cerrar sesión", use_container_width=True):
+                st.session_state.pop("authenticated", None)
+                st.info("Sesión cerrada")
+                time.sleep(1)
+                st.rerun()
+
+
 def ensure_session():
-    """Inicializa session_state con datos persistentes y autenticación.
-    Recarga automáticamente cuando cambia la semana."""
+    """Inicializa session_state con datos persistentes y autenticación."""
     
-    # Inicializar autenticación si no existe
+    # Inicializar autenticación
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
-    if "username" not in st.session_state:
-        st.session_state.username = None
-    if "role" not in st.session_state:
-        st.session_state.role = None
     
     # Inicializar week_offset si no existe
     if "week_offset" not in st.session_state:
         st.session_state.week_offset = 0
+    
+    # Inicializar records si no existe
+    if "records" not in st.session_state:
+        st.session_state.records = []
+    
+    # Inicializar crane_table si no existe
+    if "crane_table" not in st.session_state:
+        st.session_state.crane_table = []
     
     # Calcular semana activa basada en week_offset
     today = datetime.date.today()
@@ -657,7 +394,7 @@ def ensure_session():
     # Guardar en session_state para usar en otras funciones
     st.session_state._active_week_start = active_week_start
     
-    # Cargar datos de la semana activa solo si el usuario está autenticado
+    # Cargar datos de la semana activa solo si está autenticado
     if st.session_state.authenticated:
         records, crane_table = load_data(week_start=active_week_start, user_id="default")
         st.session_state.records = records
@@ -911,21 +648,16 @@ def main():
     st.set_page_config(page_title="Planificación Ventanas", layout="wide")
     st.title("Planificación Ventanas")
     
-    # Inicializar base de datos
-    init_database()
-    init_users_table()
-    
     # Inicializar session_state
     ensure_session()
     
     # GUARDIA DE AUTENTICACIÓN: Si no está autenticado, mostrar login y detener
     if not st.session_state.get("authenticated"):
-        show_login()
+        show_simple_login()
         st.stop()
     
     # Si llegó aquí, el usuario está autenticado
     show_logout_section()
-    show_change_password_modal()
 
     # Reset sidebar inputs safely (before widgets are created)
     if st.session_state.get("reset_form", False):
@@ -939,11 +671,6 @@ def main():
         st.session_state["reset_form"] = False
 
     # Sidebar: filtros y registro
-    # Botón para cambiar contraseña
-    if st.sidebar.button("🔑 Cambiar contraseña"):
-        st.session_state.show_change_password = not st.session_state.get("show_change_password", False)
-        st.rerun()
-    
     st.sidebar.header("Filtros / Registro")
     # Servicio select (expuesto fuera de any form so it updates immediately)
     servicio = st.sidebar.selectbox("Servicio", options=list(LINE_SERVICES.keys()), key="servicio_select")
