@@ -645,6 +645,8 @@ def main():
                 if st.button("🗑️", key=f"delete_{idx}"):
                     st.session_state.records.pop(idx)
                     st.session_state.pop("editing_idx", None)
+                    # Guardar cambios en la base de datos
+                    save_records_session(st.session_state.records)
                     safe_rerun()
         
         # Si se selecciona editar, mostrar formulario de edición
@@ -686,6 +688,8 @@ def main():
                         "fecha_inicio": fecha_inicio,
                         "turno_inicio": turno_inicio,
                     }
+                    # Guardar cambios en la base de datos
+                    save_records_session(st.session_state.records)
                     st.session_state.pop("editing_idx", None)
                     st.session_state.pop("selected_turn", None)
                     st.session_state.pop("turno_selector", None)
