@@ -304,15 +304,25 @@ LINE_SERVICES = {
 
 
 def ensure_session():
-    """Inicializa session_state con datos persistentes de la semana actual."""
-    if "records" not in st.session_state:
-        # Cargar registros desde la BD (semana actual, usuario por defecto)
-        week_start = get_current_week_start()
-        records, crane_table = load_data(week_start=week_start, user_id="default")
-        st.session_state.records = records
-        st.session_state.crane_table = crane_table
-    if "crane_table" not in st.session_state:
-        st.session_state.crane_table = []
+    """Inicializa session_state con datos persistentes de la semana activa.
+    Recarga automáticamente cuando cambia la semana."""
+    # Inicializar week_offset si no existe
+    if "week_offset" not in st.session_state:
+        st.session_state.week_offset = 0
+    
+    # Calcular semana activa basada en week_offset
+    today = datetime.date.today()
+    current_week_start = today - timedelta(days=today.weekday())
+    week_offset = st.session_state.get("week_offset", 0)
+    active_week_start = (current_week_start + timedelta(weeks=week_offset)).isoformat()
+    
+    # Guardar en session_state para usar en otras funciones
+    st.session_state._active_week_start = active_week_start
+    
+    # Cargar datos de la semana activa (siempre, para soportar navegación de semanas)
+    records, crane_table = load_data(week_start=active_week_start, user_id="default")
+    st.session_state.records = records
+    st.session_state.crane_table = crane_table
 
 
 def get_active_week_start():
@@ -326,13 +336,15 @@ def get_active_week_start():
 
 def save_records_session(records):
     """Wrapper para save_records() que automáticamente obtiene semana y usuario actuales."""
-    week_start = get_active_week_start()
+    # Usar la semana activa ya calculada en ensure_session()
+    week_start = st.session_state.get("_active_week_start", get_current_week_start())
     save_records(records, week_start=week_start, user_id="default")
 
 
 def save_crane_table_session(crane_table):
     """Wrapper para save_crane_table() que automáticamente obtiene semana y usuario actuales."""
-    week_start = get_active_week_start()
+    # Usar la semana activa ya calculada en ensure_session()
+    week_start = st.session_state.get("_active_week_start", get_current_week_start())
     save_crane_table(crane_table, week_start=week_start, user_id="default")
 
 
@@ -713,6 +725,7 @@ def main():
                 st.session_state.week_offset += 1
                 st.rerun()
         
+        # Usar la semana activa que ya fue calculada en ensure_session()
         week_offset = st.session_state.week_offset
         selected_week_start = current_week_start + timedelta(weeks=week_offset)
         selected_week_end = selected_week_start + timedelta(days=6)
