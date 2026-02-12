@@ -6,6 +6,266 @@ import plotly.express as px
 import plotly.graph_objects as go
 import time
 import math
+import sqlite3
+import os
+import json
+from pathlib import Path
+
+plotly_events_import_error = None
+try:
+    from streamlit_plotly_events import plotly_events
+except ImportError as exc:
+    plotly_events = None
+    plotly_events_import_error = exc
+
+
+# ============================================================================
+# PERSISTENCIA DE DATOS CON SQLITE
+# ============================================================================
+
+def get_db_path():
+    """Retorna la ruta de la base de datos SQLite en .streamlit/
+    Compatible con Streamlit Cloud."""
+    db_dir = Path(".streamlit")
+    db_dir.mkdir(exist_ok=True)  # Crear directorio si no existe
+    db_path = db_dir / "planificacion_data.db"
+    return str(db_path)
+
+
+def init_database():
+    """Crea las tablas de la base de datos si no existen.
+    Activa configuración segura de SQLite (WAL, foreign_keys)."""
+    db_path = get_db_path()
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    
+    # Activar modo WAL para mejor concurrencia
+    cursor.execute("PRAGMA journal_mode = WAL")
+    cursor.execute("PRAGMA foreign_keys = ON")
+    
+    # Tabla de registros (buques/planificaciones) con versionado temporal
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            linea TEXT NOT NULL,
+            servicio TEXT NOT NULL,
+            buque TEXT NOT NULL,
+            rendimiento REAL NOT NULL,
+            movimientos INTEGER NOT NULL,
+            fecha_inicio TEXT NOT NULL,
+            turno_inicio TEXT NOT NULL,
+            week_start TEXT NOT NULL,
+            user_id TEXT NOT NULL DEFAULT 'default',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    
+    # Tabla de asignación de grúas con versionado temporal
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS crane_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            buque TEXT NOT NULL,
+            inicio TEXT NOT NULL,
+            sts REAL NOT NULL,
+            mhc REAL NOT NULL,
+            rend_sts REAL NOT NULL,
+            rend_mhc REAL NOT NULL,
+            turnos INTEGER NOT NULL,
+            week_start TEXT NOT NULL,
+            user_id TEXT NOT NULL DEFAULT 'default',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1
+        )
+    """)
+    
+    conn.commit()
+    conn.close()
+
+
+def get_current_week_start():
+    """Retorna el lunes de la semana actual en formato YYYY-MM-DD."""
+    today = datetime.date.today()
+    return (today - timedelta(days=today.weekday())).isoformat()
+
+
+def load_data(week_start=None, user_id="default"):
+    """Carga registros y asignaciones de grúas solo de la semana activa y usuario.
+    
+    Args:
+        week_start: Fecha en formato YYYY-MM-DD. Si es None, usa la semana actual.
+        user_id: ID del usuario. Por defecto "default" para compatibilidad.
+    
+    Retorna:
+        (records, crane_table): Listas de datos activos para la semana/usuario.
+    """
+    if week_start is None:
+        week_start = get_current_week_start()
+    
+    db_path = get_db_path()
+    
+    # Si la BD no existe, retornar datos vacíos
+    if not os.path.exists(db_path):
+        return [], []
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Cargar registros activos de la semana actual
+        cursor.execute("""
+            SELECT linea, servicio, buque, rendimiento, movimientos, fecha_inicio, turno_inicio
+            FROM records
+            WHERE week_start = ? AND user_id = ? AND is_active = 1
+            ORDER BY created_at DESC
+        """, (week_start, user_id))
+        records_rows = cursor.fetchall()
+        records = []
+        for row in records_rows:
+            records.append({
+                "linea": row[0],
+                "servicio": row[1],
+                "buque": row[2],
+                "rendimiento": row[3],
+                "movimientos": row[4],
+                "fecha_inicio": datetime.datetime.strptime(row[5], "%Y-%m-%d").date(),
+                "turno_inicio": row[6],
+            })
+        
+        # Cargar asignaciones activas de grúas de la semana actual
+        cursor.execute("""
+            SELECT buque, inicio, sts, mhc, rend_sts, rend_mhc, turnos
+            FROM crane_assignments
+            WHERE week_start = ? AND user_id = ? AND is_active = 1
+            ORDER BY created_at DESC
+        """, (week_start, user_id))
+        crane_rows = cursor.fetchall()
+        crane_table = []
+        for row in crane_rows:
+            crane_table.append({
+                "Buque": row[0],
+                "inicio": row[1],
+                "STS": row[2],
+                "MHC": row[3],
+                "Rend. STS": row[4],
+                "Rend. MHC": row[5],
+                "Turnos": row[6],
+            })
+        
+        conn.close()
+        return records, crane_table
+    
+    except Exception as e:
+        st.error(f"Error al cargar datos: {e}")
+        return [], []
+
+
+def save_records(records, week_start=None, user_id="default"):
+    """Guarda registros sin borrar histórico. Inserta nuevas versiones.
+    
+    Args:
+        records: Lista de registros a guardar.
+        week_start: Fecha en formato YYYY-MM-DD. Si es None, usa la semana actual.
+        user_id: ID del usuario. Por defecto "default".
+    """
+    if week_start is None:
+        week_start = get_current_week_start()
+    
+    db_path = get_db_path()
+    init_database()  # Asegurar que la BD existe
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Desactivar registros viejos de esta semana/usuario en lugar de borrar
+        cursor.execute("""
+            UPDATE records
+            SET is_active = 0, updated_at = ?
+            WHERE week_start = ? AND user_id = ? AND is_active = 1
+        """, (datetime.datetime.now().isoformat(), week_start, user_id))
+        
+        # Insertar nuevos registros como activos (versionado)
+        now = datetime.datetime.now().isoformat()
+        for record in records:
+            fecha_str = record["fecha_inicio"].isoformat() if isinstance(record["fecha_inicio"], date) else str(record["fecha_inicio"])
+            cursor.execute("""
+                INSERT INTO records (linea, servicio, buque, rendimiento, movimientos, fecha_inicio, turno_inicio, week_start, user_id, created_at, updated_at, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """, (
+                record.get("linea", ""),
+                record.get("servicio", ""),
+                record.get("buque", ""),
+                float(record.get("rendimiento", 0)),
+                int(record.get("movimientos", 0)),
+                fecha_str,
+                record.get("turno_inicio", "T1"),
+                week_start,
+                user_id,
+                now,
+                now,
+            ))
+        
+        conn.commit()
+        conn.close()
+    
+    except Exception as e:
+        st.error(f"Error al guardar registros: {e}")
+
+
+def save_crane_table(crane_table, week_start=None, user_id="default"):
+    """Guarda asignaciones de grúas sin borrar histórico. Inserta nuevas versiones.
+    
+    Args:
+        crane_table: Lista de asignaciones a guardar.
+        week_start: Fecha en formato YYYY-MM-DD. Si es None, usa la semana actual.
+        user_id: ID del usuario. Por defecto "default".
+    """
+    if week_start is None:
+        week_start = get_current_week_start()
+    
+    db_path = get_db_path()
+    init_database()  # Asegurar que la BD existe
+    
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Desactivar asignaciones viejas en lugar de borrar
+        cursor.execute("""
+            UPDATE crane_assignments
+            SET is_active = 0, updated_at = ?
+            WHERE week_start = ? AND user_id = ? AND is_active = 1
+        """, (datetime.datetime.now().isoformat(), week_start, user_id))
+        
+        # Insertar nuevas asignaciones como activas (versionado)
+        now = datetime.datetime.now().isoformat()
+        for crane in crane_table:
+            cursor.execute("""
+                INSERT INTO crane_assignments (buque, inicio, sts, mhc, rend_sts, rend_mhc, turnos, week_start, user_id, created_at, updated_at, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            """, (
+                crane.get("Buque", ""),
+                crane.get("inicio", ""),
+                float(crane.get("STS", 0)),
+                float(crane.get("MHC", 0)),
+                float(crane.get("Rend. STS", 0)),
+                float(crane.get("Rend. MHC", 0)),
+                int(crane.get("Turnos", 0)),
+                week_start,
+                user_id,
+                now,
+                now,
+            ))
+        
+        conn.commit()
+        conn.close()
+    
+    except Exception as e:
+        st.error(f"Error al guardar asignaciones de grúas: {e}")
+
 
 plotly_events_import_error = None
 try:
@@ -44,10 +304,36 @@ LINE_SERVICES = {
 
 
 def ensure_session():
+    """Inicializa session_state con datos persistentes de la semana actual."""
     if "records" not in st.session_state:
-        st.session_state.records = []
+        # Cargar registros desde la BD (semana actual, usuario por defecto)
+        week_start = get_current_week_start()
+        records, crane_table = load_data(week_start=week_start, user_id="default")
+        st.session_state.records = records
+        st.session_state.crane_table = crane_table
     if "crane_table" not in st.session_state:
         st.session_state.crane_table = []
+
+
+def get_active_week_start():
+    """Obtiene el lunes de la semana actualmente mostrada en el UI.
+    Usa week_offset de session_state para calcular la fecha."""
+    current_week_start = datetime.date.today() - timedelta(days=datetime.date.today().weekday())
+    week_offset = st.session_state.get("week_offset", 0)
+    active_week_start = current_week_start + timedelta(weeks=week_offset)
+    return active_week_start.isoformat()
+
+
+def save_records_session(records):
+    """Wrapper para save_records() que automáticamente obtiene semana y usuario actuales."""
+    week_start = get_active_week_start()
+    save_records(records, week_start=week_start, user_id="default")
+
+
+def save_crane_table_session(crane_table):
+    """Wrapper para save_crane_table() que automáticamente obtiene semana y usuario actuales."""
+    week_start = get_active_week_start()
+    save_crane_table(crane_table, week_start=week_start, user_id="default")
 
 
 def split_into_shifts(start_date, hours, start_shift="T1"):
@@ -310,6 +596,8 @@ def main():
             "fecha_inicio": fecha_inicio,
             "turno_inicio": turno_inicio,
         })
+        # Guardar en BD
+        save_records_session(st.session_state.records)
         st.sidebar.success("Registro agregado")
         # Reset sidebar filters/inputs on next run
         st.session_state["reset_form"] = True
@@ -322,7 +610,11 @@ def main():
         st.session_state.pop("selected_turn", None)
         st.session_state.pop("turno_selector", None)
         st.session_state.pop("crane_table", None)
+        # Guardar cambios en BD
+        save_records_session([])
+        save_crane_table_session([])
         safe_rerun()
+
 
     # --- Editar registros existentes ---
     st.sidebar.divider()
@@ -428,8 +720,7 @@ def main():
         st.info(f"Mostrando semana {selected_week_start.isocalendar()[1]}")
         
         # Build Gantt-like dataframe: start (datetime) and end (datetime)
-        # Build timeline segmented by shifts using records_to_dataframe
-        df_shifts = records_to_dataframe(records, overrides=None)
+        # Build timeline dynamically, turn by turn, using crane assignments when present
         gantt_rows = []
 
         # Preparar asignaciones de grúas por buque y turno
@@ -456,8 +747,8 @@ def main():
             except Exception:
                 return None, None
 
-        # Construir mapa de capacidad por turno desde la tabla de grúas
-        crane_capacity_by_turn = {}
+        # Construir mapa de asignación de grúas por turno (buque, fecha, turno)
+        turn_to_crane_by_key = {}
         for row in st.session_state.get("crane_table", []):
             buque_name = row.get("Buque", "")
             if not buque_name:
@@ -475,130 +766,85 @@ def main():
                 continue
             start_shift = {1: "T1", 2: "T2", 3: "T3"}.get(start_shift_num, "T1")
 
-            sts = safe_num(row.get("STS", 0))
-            mhc = safe_num(row.get("MHC", 0))
-            rend_sts = safe_num(row.get("Rend. STS", 0))
-            rend_mhc = safe_num(row.get("Rend. MHC", 0))
-            total_rate = sts * rend_sts + mhc * rend_mhc
-            capacity_per_turn = total_rate * 6.3
-
             seq = build_shift_sequence(start_date, start_shift, turnos)
             for day, shift_num in seq:
-                crane_capacity_by_turn[(buque_name, day, shift_num)] = capacity_per_turn
+                turn_to_crane_by_key[(buque_name, day, shift_num)] = row
 
-        # Group shifts by originating registro (buque + orig_fecha)
-        grouped = df_shifts.groupby(["buque", "orig_fecha"])
-        for (buque_name, orig_fecha), group in grouped:
-            g = group.sort_values(["fecha", "shift"]).reset_index(drop=True)
-            # find the original registro for totals
-            reg = next((r for r in records if r["buque"] == buque_name and r["fecha_inicio"] == orig_fecha), None)
-            ov = {}
-            total_moves = reg.get("movimientos", 0) if reg else 0
+        # Generar turnos dinámicamente por registro (buque + fecha_inicio)
+        for reg in records:
+            buque_name = reg.get("buque", "")
+            if not buque_name:
+                continue
+            start_date = reg.get("fecha_inicio", None)
+            if not start_date:
+                continue
+            start_shift = reg.get("turno_inicio", "T1")
+            shift_map = {"T1": 1, "T2": 2, "T3": 3}
+            shift_num = shift_map.get(start_shift, 1)
+
+            total_moves = int(reg.get("movimientos", 0) or 0)
             remaining = float(total_moves)
-            eff_rend = reg.get("rendimiento", 0) if reg else 0.0
+            eff_rend = float(reg.get("rendimiento", 0) or 0)
 
-            # Calcular movimientos por turno con nueva lógica
-            movements_list = []
-            accumulated_moves = 0
-            
-            # Mapear cada turno con su asignación de grúas (si aplica)
-            # crane_table puede tener asignaciones con múltiples turnos consecutivos
-            turn_to_crane = {}
-            for crane_row in st.session_state.get("crane_table", []):
-                if crane_row.get("Buque") != buque_name:
-                    continue
-                inicio_val = crane_row.get("inicio", "")
-                turnos_asignados = int(crane_row.get("Turnos", 0) or 0)
-                
-                # Encontrar el turno de inicio en g
-                start_idx = None
-                for idx in range(len(g)):
-                    row = g.loc[idx]
-                    shift = int(row["shift"])
-                    date = row["fecha"]
-                    turn_label = f"T{shift}-{date.strftime('%d/%m') if hasattr(date, 'strftime') else str(date)}"
-                    if turn_label == inicio_val:
-                        start_idx = idx
-                        break
-                
-                # Asignar las grúas a los turnos consecutivos
-                if start_idx is not None:
-                    for offset in range(turnos_asignados):
-                        if start_idx + offset < len(g):
-                            turn_to_crane[start_idx + offset] = crane_row
+            day = start_date
+            safety = 0
+            while remaining > 0 and safety < 2000:
+                start_dt, end_dt = _shift_window_bounds(day, shift_num)
+                hours = (end_dt - start_dt).total_seconds() / 3600.0
 
-            for idx in range(len(g)):
-                row = g.loc[idx]
-                date = row["fecha"]
-                shift = int(row["shift"])
-
-                # Calcular rendimiento del turno
-                if idx in turn_to_crane:
-                    # Si hay asignación de grúas, calcular rendimiento desde grúas
-                    crane_row = turn_to_crane[idx]
+                # Calcular rendimiento del turno según asignación de grúas
+                key = (buque_name, day, shift_num)
+                if key in turn_to_crane_by_key:
+                    crane_row = turn_to_crane_by_key[key]
                     sts = float(crane_row.get("STS", 0) or 0)
                     mhc = float(crane_row.get("MHC", 0) or 0)
                     rend_sts = float(crane_row.get("Rend. STS", 0) or 0)
                     rend_mhc = float(crane_row.get("Rend. MHC", 0) or 0)
                     turno_rend = sts * rend_sts + mhc * rend_mhc
                 else:
-                    # Si no hay asignación, usar rendimiento del registro
                     turno_rend = eff_rend
 
-                # Calcular movimientos del turno: rendimiento × 6.3
-                mov_turno = math.floor(turno_rend * 6.3)
-                
-                # Verificar si este sería el último turno (suma >= total)
-                if accumulated_moves + mov_turno >= total_moves:
-                    # Último turno: asignar solo el residuo exacto
-                    mov_turno = max(0, int(total_moves - accumulated_moves))
-                    movements_list.append(mov_turno)
-                    break  # Terminar aquí, no agregar más turnos
-                
-                movements_list.append(mov_turno)
-                accumulated_moves += mov_turno
+                # Capacidad del turno
+                capacity = math.floor(turno_rend * 6.3)
+                if capacity <= 0:
+                    break
 
-            # Second pass: build gantt_rows with calculated movements
-            for idx in range(len(g)):
-                row = g.loc[idx]
-                date = row["fecha"]
-                shift = int(row["shift"])
-                start_dt, end_dt = _shift_window_bounds(date, shift)
-                hours = (end_dt - start_dt).total_seconds() / 3600.0
+                mov_turno = min(remaining, capacity)
+                if hours > 1e-6 and mov_turno > 0:
+                    if key in turn_to_crane_by_key:
+                        sts_lbl = int(turn_to_crane_by_key[key].get("STS", 0) or 0)
+                        mhc_lbl = int(turn_to_crane_by_key[key].get("MHC", 0) or 0)
+                        mov_label = f"{int(mov_turno)} ({sts_lbl}S, {mhc_lbl}M)"
+                    else:
+                        mov_label = f"{int(mov_turno)}"
 
-                # Usar el valor ya calculado en movements_list
-                if idx < len(movements_list):
-                    mov_floored = movements_list[idx]
+                    turn_label = f"T{shift_num}-{day.strftime('%d/%m') if hasattr(day, 'strftime') else str(day)}"
+                    gantt_rows.append({
+                        "buque": buque_name,
+                        "linea": reg.get("linea", ""),
+                        "start": start_dt,
+                        "end": end_dt,
+                        "fecha": day,
+                        "shift": shift_num,
+                        "turn_label": turn_label,
+                        "horas": hours,
+                        "movimientos": None,
+                        "mov_per_turn": int(mov_turno),
+                        "mov_label": mov_label,
+                    })
+
+                remaining -= mov_turno
+
+                # avanzar al siguiente turno
+                if shift_num == 1:
+                    shift_num = 2
+                elif shift_num == 2:
+                    shift_num = 3
                 else:
-                    mov_floored = 0
+                    shift_num = 1
+                    day = day + timedelta(days=1)
 
-                # Saltar si no hay horas o si no hay movimientos
-                if hours <= 1e-6 or mov_floored <= 0:
-                    continue
-
-                # Verificar si este turno tiene asignación de grúas
-                if idx in turn_to_crane:
-                    crane_row = turn_to_crane[idx]
-                    sts = int(crane_row.get("STS", 0) or 0)
-                    mhc = int(crane_row.get("MHC", 0) or 0)
-                    mov_label = f"{mov_floored}\n{sts} STS, {mhc} MHC"
-                else:
-                    mov_label = f"{mov_floored}"
-                
-                turn_label = f"T{shift}-{date.strftime('%d/%m') if hasattr(date, 'strftime') else str(date)}"
-                gantt_rows.append({
-                    "buque": buque_name,
-                    "linea": row.get("linea", ""),
-                    "start": start_dt,
-                    "end": end_dt,
-                    "fecha": date,
-                    "shift": shift,
-                    "turn_label": turn_label,
-                    "horas": hours,
-                    "movimientos": None,
-                    "mov_per_turn": mov_floored,
-                    "mov_label": mov_label,
-                })
+                safety += 1
         df_gantt = pd.DataFrame(gantt_rows)
 
         # Filter to only rows within the selected week
@@ -633,12 +879,19 @@ def main():
             )
             fig.update_yaxes(autorange="reversed")
             
-            # Update traces to show text centered on bars with background
+            # Configure text to show inside bars
             fig.update_traces(
                 textposition="inside",
-                textfont=dict(size=20, color="white", family="Arial", weight="bold"),
+                textfont=dict(size=16, color="white", family="Arial, sans-serif"),
                 insidetextanchor="middle",
+                cliponaxis=False,
+                texttemplate='<b>%{text}</b>',
             )
+            
+            # Calculate dynamic height based on number of unique ships
+            num_ships = df_gantt["buque"].nunique()
+            bar_height = 120  # Height per ship in pixels
+            chart_height = max(600, num_ships * bar_height + 200)  # Min 600px, add 200 for margins/title
             
             fig.update_layout(
                 title="Cronograma",
@@ -646,14 +899,13 @@ def main():
                 yaxis_title="Buque",
                 legend_title_text="Línea",
                 margin=dict(l=120, r=20, t=60, b=100),
-                height=600,
+                height=chart_height,
                 template="plotly_dark",
                 plot_bgcolor="rgba(0,0,0,0)",
                 paper_bgcolor="rgba(0,0,0,0)",
                 clickmode="event+select",
-                bargap=0.3,  # Reduce gap between bars to make them thicker (0-1, smaller = thicker bars)
-                uniformtext_minsize=8,
-                uniformtext_mode='hide',
+                bargap=0.05,
+                uniformtext=dict(mode="show", minsize=8),
             )
             # Date formatting and gridlines
             # Force x-axis range to show full week (Monday to Sunday)
@@ -822,6 +1074,8 @@ def main():
                     # Recalcular movimientos y restantes usando la lógica existente
                     crane_df = pd.DataFrame.from_records(crane_rows)
                     st.session_state["crane_table"] = compute_crane_table_from_df(st.session_state.records, crane_df)
+                    # Guardar en BD
+                    save_crane_table_session(st.session_state["crane_table"])
                     st.rerun()
 
 
